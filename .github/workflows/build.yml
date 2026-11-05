@@ -1,0 +1,132 @@
+name: Build VRD ESP
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    # ------
+    # 1. Checkout
+    # ------
+    - name: Checkout source
+      uses: actions/checkout@v4
+
+    # ------
+    # 2. Install WDK via Chocolatey
+    # windows-latest has MSVC 2022, CMake, Git already
+    # ------
+    - name: Install WDK
+      shell: powershell
+      run: |
+        choco install windows-driver-kit --yes --no-progress
+        # Refresh PATH so MSBuild can find WDK
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+
+    # ------
+    # 3. Clone ImGui (v1.91.0)
+    # ------
+    - name: Clone ImGui
+      shell: cmd
+      run: |
+        if not exist external\imgui\imgui.h (
+          git clone https://github.com/ocornut/imgui.git --branch v1.91.0 --depth 1 external\imgui
+        )
+
+    # ------
+    # 4. Find MSBuild
+    # ------
+    - name: Locate MSBuild
+      id: msbuild
+      shell: powershell
+      run: |
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild `
+                              -find "MSBuild\**\Bin\MSBuild.exe" 2>$null | Select-Object -First 1
+        if (-not $msbuild) {
+          $msbuild = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe"
+        }
+        echo "MSBUILD_PATH=$msbuild" >> $env:GITHUB_ENV
+        Write-Host "MSBuild: $msbuild"
+
+    # ------
+    # 5. Set up VC environment
+    # ------
+    - name: Setup VC x64 environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+
+    # ------
+    # 6. Build kernel driver (vread.sys)
+    # ------
+    - name: Build driver
+      shell: cmd
+      run: |
+        mkdir driver\build\Release 2>nul
+        mkdir driver\build\obj 2>nul
+        "%MSBUILD_PATH%" driver\vread.vcxproj /p:Configuration=Release /p:Platform=x64 /verbosity:minimal /nologo
+        if errorlevel 1 (
+          echo [!] Driver build FAILED
+          exit /b 1
+        )
+        echo [+] vread.sys built OK
+
+    # ------
+    # 7. Build loader
+    # ------
+    - name: Build loader
+      shell: cmd
+      run: |
+        cmake -B loader\build -G "Visual Studio 17 2022" -A x64 loader -DCMAKE_BUILD_TYPE=Release
+        cmake --build loader\build --config Release
+        if errorlevel 1 (
+          echo [!] Loader build FAILED
+          exit /b 1
+        )
+        echo [+] loader.exe built OK
+
+    # ------
+    # 8. Build ESP overlay
+    # ------
+    - name: Build ESP
+      shell: cmd
+      run: |
+        cmake -B cheat\build -G "Visual Studio 17 2022" -A x64 cheat -DCMAKE_BUILD_TYPE=Release
+        cmake --build cheat\build --config Release
+        if errorlevel 1 (
+          echo [!] ESP build FAILED
+          exit /b 1
+        )
+        echo [+] esp.exe built OK
+
+    # ------
+    # 9. Assemble LAUNCH folder
+    # ------
+    - name: Assemble LAUNCH folder
+      shell: cmd
+      run: |
+        mkdir LAUNCH 2>nul
+        copy /y driver\build\Release\vread.sys     LAUNCH\vread.sys
+        copy /y loader\build\Release\loader.exe    LAUNCH\loader.exe
+        copy /y cheat\build\Release\esp.exe        LAUNCH\esp.exe
+        copy /y RODAR.bat                          LAUNCH\RODAR.bat
+        echo.                                    > LAUNCH\COLOQUE_RTCORE_AQUI.txt
+        echo Baixe o rtcore64.sys e coloque AQUI. >> LAUNCH\COLOQUE_RTCORE_AQUI.txt
+        echo Hash SHA256: f6f11ad2cd2b0cf95ed42324876bee1d83e01775d8dd92daaea85012e1245fd >> LAUNCH\COLOQUE_RTCORE_AQUI.txt
+        echo Busque: "rtcore64.sys kdmapper github"  >> LAUNCH\COLOQUE_RTCORE_AQUI.txt
+        dir LAUNCH\
+
+    # ------
+    # 10. Upload artifact (download from Actions page)
+    # ------
+    - name: Upload LAUNCH artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: LAUNCH-pronto
+        path: LAUNCH\
+        retention-days: 30
